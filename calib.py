@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import glob
+import os
+import yaml
 def matrix_to_string(matrix):
     return "\n".join([" ".join(map(str, row)) for row in matrix])
 # 相机标定
@@ -91,6 +93,24 @@ def undistort_images(image, camera_matrix, dist_coeffs):
     newcameramatrix, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (image.shape[1], image.shape[0]), 1, (image.shape[1], image.shape[0]))
     undistorted_img = cv2.undistort(image, camera_matrix, dist_coeffs, None, newcameramatrix)
     return undistorted_img
+
+def save_calibration_parameters(filename, K1, K2, D1, D2, R1, R2, P1, P2, Q, R, T):
+    calibration_data = {
+        'K1': K1.tolist(),
+        'K2': K2.tolist(),
+        'D1': D1.tolist(),
+        'D2': D2.tolist(),
+        'R1': R1.tolist(),        
+        'R2': R2.tolist(),
+        'R': R.tolist(),
+        'T': T.tolist(),
+        'P1': P1.tolist(),
+        'P2': P2.tolist(),
+        'Q': Q.tolist()
+    }
+    with open(filename, 'w') as file:
+        yaml.dump(calibration_data, file)
+    print(f"参数已写入 {filename} 文件")
 def stereo_rectify(K1, D1, K2, D2, img_size, R, T):
     # 计算立体校正的旋转矩阵和平移向量
     R1, R2, P1, P2, Q, validPixROI1, validPixROI2 = cv2.stereoRectify(
@@ -98,17 +118,19 @@ def stereo_rectify(K1, D1, K2, D2, img_size, R, T):
     )
     map1x, map1y = cv2.initUndistortRectifyMap(K1, D1, R1, P1, img_size, cv2.CV_32FC1)
     map2x, map2y = cv2.initUndistortRectifyMap(K2, D2, R2, P2, img_size, cv2.CV_32FC1)
+    # 保存参数到 YAML 文件
+    save_calibration_parameters('calibration.yaml', K1, K2, D1, D2, R1, R2, P1, P2, Q, R, T)
     return map1x, map1y, map2x, map2y, P1, P2, Q
 
 # 主函数
 def main():
     image_width, image_height = 640, 480
     w, h = 10, 7
-    square_size = 0.3975  #meter
-    images1 = glob.glob('D:\calib\images3\*.png') #left
-    images2 = glob.glob('D:\calib\images4\*.png')#right
-    file_path1 = './images5'
-    file_path2 = './images6'
+    square_size = 0.03975  #meter
+    images1 = glob.glob('D:/calib/data/images4/*.png') #left
+    images2 = glob.glob('D:/calib/data/images3/*.png')#right
+    file_path1 = glob.glob('D:/calib/data/007/*.png')
+    file_path2 = glob.glob('D:/calib/data/008/*.png')
     K1, D1 = calibrate_camera(images1, w, h, square_size)    
     K2, D2 = calibrate_camera(images2, w, h, square_size)
     R, T = stereo_calibrate(images1, images2, image_width, image_height, w, h, K1, D1, K2, D2, square_size)
@@ -127,37 +149,49 @@ def main():
     map1x, map1y, map2x, map2y, P1, P2, Q = stereo_rectify(
         K1, D1, K2, D2, (image_width, image_height), R, T
     )
+    # filename = 'data/came.yaml'
+    # calibration_data = {
+    #     'K1': K1.tolist(),
+    #     'K2': K2.tolist(),
+    #     'D1': D1.tolist(),
+    #     'D2': D2.tolist(),
+    #     'R1': map2x.tolist(),
+    #     'R2': map2y.tolist(),
+    #     'P1': P1.tolist(),
+    #     'P2': P2.tolist(),
+    #     'Q': Q.tolist()
+    # }
+    # with open(filename, 'w') as file:
+    #     yaml.dump(calibration_data, file)
+    # print(f"参数已写入 {filename} 文件")
     print('P1:',P1)
     print('P2:',P2)
     print('Q:',Q)
+    i=0
     # 应用畸变矫正映射
-    for fname1, fname2 in zip(images1,images2):
+    for fname1, fname2 in zip(file_path1, file_path2):
         img1 = cv2.imread(fname1)
         img2 = cv2.imread(fname2)
         rectified_img1 = cv2.remap(img1, map1x, map1y, cv2.INTER_LINEAR)
         rectified_img2 = cv2.remap(img2, map2x, map2y, cv2.INTER_LINEAR)
-        #draw = (ImageDraw.Draw(fname1))        # 获取图片的宽度和高度
-        line_color = (0, 255, 0)
-        # 每隔200个像素画一条横线
-        for y in range(0, image_height, 20):
-            cv2.line(rectified_img1, (0, y), (image_width, y), line_color, 1)
-            cv2.line(rectified_img2, (0, y), (image_width, y), line_color, 1)
-       
-        # target_folder = 'D:\calib\images5'
-        # output_file_path = os.path.join(target_folder)
-        # img1.save(output_file_path)
-        # target_folder = 'D:\calib\images6'
-        # output_file_path = os.path.join(target_folder)
-        # img2.save(output_file_path) 
-        # filename1 = f"{folder_name1}/image_{timestamp}.jpg"
-        # cv2.imwrite(filename1, rectified_img1)
-        # cv2.imwrite(filename1, rectified_img2)
-        # print(f"Image with lines has been saved to {output_file_path}")
+        cv2.imshow('Rectified Left', rectified_img1)
+        cv2.imshow('Rectified Right', rectified_img2)
+        #cv2.waitKey(0)
+        cv2.waitKey(1)
+        sav1 = "D:/calib/data/005"
+        sav2 = "D:/calib/data/006"
         
-        # cv2.imshow('Rectified Left', rectified_img1)
-        # cv2.imshow('Rectified right', rectified_img2)
-        # cv2.waitKey(0)
+        filename1 = os.path.join(sav1, os.path.basename(fname1))
+        filename2 = os.path.join(sav2, os.path.basename(fname2))
+        
+        cv2.imwrite(filename1, rectified_img1)
+        cv2.imwrite(filename2, rectified_img2)
+        
+        print(f"Rectified image saved to {filename1}")
+        print(f"Rectified image saved to {filename2}")
+
     cv2.destroyAllWindows()
+    
    
 if __name__ == "__main__":
     main()

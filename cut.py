@@ -3,9 +3,9 @@ from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 # 设置图片文件夹路径
-folder_path = 'captured_images/sofa'
-sav1 = 'images9'
-sav2 = 'imagesx'
+folder_path = 'captured_images/closeavi'
+sav1 = '008'
+sav2 = '007'
 if not os.path.exists(sav1):
     os.makedirs(sav1)
 if not os.path.exists(sav2):
