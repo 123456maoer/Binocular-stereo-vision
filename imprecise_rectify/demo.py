@@ -5,14 +5,13 @@ import numpy as np
 import glob
 import models.multiloss
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
 import torch
 from torchvision import datasets, transforms
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
-from models.dfd import Dfd_net,psi_to_depth
 from models.stackhourglass import PSMNet
 # import wandb_demo
 import wandb
@@ -210,7 +209,7 @@ def get_mono_and_unrect_stereo(stereo_model, mono_net, midas_model, left, small_
             mono_out = torch.unsqueeze(dfd_mono_out, 0)
         else:
             mono_out_unet = predict_full_img(unet, left, device=device)
-            mono_out_unet = psi_to_depth(mono_out_unet, focal_point=1.5)
+            # mono_out_unet = psi_to_depth(mono_out_unet, focal_point=1.5)
             mono_out = torch.unsqueeze(mono_out_unet, 0)
 
         _, stereo_unrect = stereo_model(small_left, small_right)
@@ -223,10 +222,10 @@ def get_mono_and_unrect_stereo(stereo_model, mono_net, midas_model, left, small_
     return stereo_unrect
 idx = 1
 
-def train(model, stereo_model, disp_model, optimizer, small_left, small_right, left, right):
+def train(model,  disp_model, optimizer, optimizer1, weight,left, right):
     global fig, ax_list, loss_list,idx,pse_rec,right_transformed_np
     model.train()
-    stereo_model.eval()
+    # stereo_model.eval()
     # disp_model.eval()
     optimizer.zero_grad()
     stereo_out, theta, right_transformed = model(left, right)
@@ -255,6 +254,10 @@ def train(model, stereo_model, disp_model, optimizer, small_left, small_right, l
     stereo_out = stereo_out[:, :256, :256]    
     mask = mask[:, :256, :256]
     loss = F.l1_loss(stereo_out[mask],pse_rec[mask])    
+    loss_disp = disp_train(disp_model,optimizer1, left, right_transformed_np)
+    loss =weight*loss+(1-weight)*loss_disp
+    # loss.retains_grad(True)
+    loss.requires_grad_(True) 
     loss_list.append(loss)    # show_depth_maps(left, right_transformed, mono_out_for_train, stereo_unrect, stereo_out)
     loss.backward()
     optimizer.step()    
@@ -278,12 +281,13 @@ def disp_train(model,optimizer1, left, right_transformed):
     from torch.autograd import Variable
     global pred_disp
     max_disp = 400
+    alpha = 0.85
     tmpdisp = int(max_disp//64*64)
     if (max_disp /64*64) > tmpdisp:
         model.module.maxdisp = tmpdisp + 64
     else:
         model.module.maxdisp = tmpdisp
-    if model.module.maxdisp ==64: model.module.maxdisp=128
+    if model.module.maxdisp ==64: model.module.maxdisp=400
     model.module.disp_reg8 =  disparityregression(model.module.maxdisp,16).cuda()
     model.module.disp_reg16 = disparityregression(model.module.maxdisp,16).cuda()
     model.module.disp_reg32 = disparityregression(model.module.maxdisp,32).cuda()
@@ -299,6 +303,7 @@ def disp_train(model,optimizer1, left, right_transformed):
     imgR = np.reshape(imgR, (3, 720, 1280))
     imgL = np.reshape(imgL,[1,3,imgL.shape[1],imgL.shape[2]])
     imgR = np.reshape(imgR,[1,3,imgR.shape[1],imgR.shape[2]])    
+    right_transformed = Variable(torch.FloatTensor(imgR).cuda())
     max_h = int(imgL.shape[2] // 64 * 64)
     max_w = int(imgL.shape[3] // 64 * 64)
     if max_h < imgL.shape[2]: max_h += 64
@@ -326,24 +331,40 @@ def disp_train(model,optimizer1, left, right_transformed):
     # 使用NumPy的logical_or函数检查无效值
     invalid = np.logical_or(pred_disp == np.inf, pred_disp != pred_disp)
     pred_disp[invalid] = np.nan
-
+    loss1 = criterion2(left, right_transformed, pred_disp)  #重构
+    # loss4 = criterion6(left, pred_disp)   #拿视差算的极线，肯定是错的，考虑能否和SURF/SIFT组合计算损失
+    loss5 = criterion5(pred_disp, left, right_transformed)  #极线
+    
+    # loss3 = criterion3(pred_disp, right_transformed)        #平滑
     from save_image_only import save_image_only
     min_val, max_val = np.nanpercentile(pred_disp, [0.5, 99.5])
     pred_disp = np.clip(pred_disp, min_val, max_val)
+
     pred_disp = (pred_disp - min_val) / (max_val - min_val)
     colored_disp = plt.cm.jet(pred_disp.squeeze())[:, :, :3] 
     # colored_disp = plt.cm.jet(pred_disp.squeeze().cpu().numpy())[:, :, :3]  # 只取RGB通道，去掉alpha通道
-    colored_disp = torch.from_numpy(colored_disp).permute(2, 0, 1) 
+    colored_disp = torch.from_numpy(colored_disp).permute(2, 0, 1)     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    colored_disp = colored_disp.float() 
+    colored_disp = colored_disp.to(device)
+    # loss2 = criterion1(left,colored_disp)
     save_image_only(pred_disp, f'%s/disp{idx}.jpg'% (folder_path), cmap='jet', save_cbar=True, save_mask=True)
     # left = left.detach().cpu().numpy()
-    loss1 = criterion1(left,colored_disp)
-    # loss1 = criterion2(left, pred_disp)
+    # loss1 = alpha * loss1 + (1-alpha) * loss3
     loss1.requires_grad_(True) 
+    
+    # freeze_specific_hourglass_modules(model, [8,16])
     loss1.backward()
-    optimizer1.step()  
+    optimizer1.step() 
     return loss1
 
+def freeze_specific_hourglass_modules(model, modules_to_freeze):
+    for module in modules_to_freeze:
+        # 通过访问 model.module 来获取原始模型的属性
+        for param in getattr(model.module, f'disp_reg{module}').parameters():
+            param.requires_grad = False
 
+# 假设我们只想冻结第1和第3个Hourglass模块
 def main(l_img=None, r_img=None):
     global loss_list,ax_list,fig,pse_rec
     torch.cuda.empty_cache()
@@ -354,15 +375,15 @@ def main(l_img=None, r_img=None):
     dfd_net = None
     unet = None
     mono_net = 'phase-mask'
-    # mono_net = 'midas'
-    #mono_net = 'unet  '
-    stereo_model = PSMNet(128, device=device, dfd_net=False, dfd_at_end=False, right_head=False)
-    stereo_model = nn.DataParallel(stereo_model)
-    stereo_model.to(device)
-    # stereo_model.cuda()
-    state_dict = torch.load('checkpoints/PSM/pretrained_model_KITTI2015.tar')
-    stereo_model.load_state_dict(state_dict['state_dict'], strict=False)
-    stereo_model.train()
+    # # mono_net = 'midas'
+    # #mono_net = 'unet  '
+    # stereo_model = PSMNet(128, device=device, dfd_net=False, dfd_at_end=False, right_head=False)
+    # stereo_model = nn.DataParallel(stereo_model)
+    # stereo_model.to(device)
+    # # stereo_model.cuda()
+    # state_dict = torch.load('checkpoints/PSM/pretrained_model_KITTI2015.tar')
+    # stereo_model.load_state_dict(state_dict['state_dict'], strict=False)
+    # stereo_model.train()
 
     stereo_model2 = PSMNet(128, device=device, dfd_net=False, dfd_at_end=False, right_head=False)
     stereo_model2 = nn.DataParallel(stereo_model2)
@@ -370,23 +391,10 @@ def main(l_img=None, r_img=None):
     stereo_model2.to(device)
     state_dict = torch.load('checkpoints/PSM/pretrained_model_KITTI2015.tar')
     stereo_model2.load_state_dict(state_dict['state_dict'], strict=False)
-    stereo_model2.train()
 
-    if mono_net == 'phase-mask':
-        dfd_net = Dfd_net(mode='segmentation', target_mode='cont', pool=False)
-        dfd_net = dfd_net.eval()
-        dfd_net = dfd_net.to(device)
-        load_model(dfd_net, device, model_path='checkpoints/Dfd/checkpoint_257.pth.tar')
-
-    elif mono_net == 'midas':
-        # load network
-        midas_model_path = 'checkpoints/Midas/model.pt'
-        midas_model = MonoDepthNet(midas_model_path)
-        midas_model.to(device)
-        midas_model.eval()
-    else:
-        unet = get_Unet('models/unet/CP100_w_noise.pth', device=device)
-
+    # state_dict = torch.load('checkpoints/demo_cp/CP92.pth')
+    # stereo_model2.load_state_dict(state_dict['theta_var'], strict=False)
+    stereo_model2.train()            
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False
     # torch.backends.cudnn.deterministic = True
@@ -396,13 +404,13 @@ def main(l_img=None, r_img=None):
     else:       
         # left_train_filelist = ['/data2/zjq/program/CalibrationNet/Sample_Images/undistort/im0.png']
         # right_train_filelist = ['/data2/zjq/program/CalibrationNet/Sample_Images/undistort/im1.png']
-        # left_train_filelist = ['/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im0.png']
-        # right_train_filelist = ['/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im1.png']
+        left_train_filelist = ['/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im0.png']
+        right_train_filelist = ['/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im1.png']
         # pse_rec_left_file = ['/data2/zjq/program/CalibrationNet/Sample_Images/pse_rec/im0.png']
-        left_train_filelist = ['/data2/zjq/program/imprecise_rectify/resize_data/4/4_2024-10-23-162316-997_1729671796830181_YUYV.png']
-        right_train_filelist = ['/data2/zjq/program/imprecise_rectify/resize_data/6/6_2024-10-23-162316-960_1729671796830181_YUYV.png']
-        pse_rec_right_file = ['/data2/zjq/program/imprecise_rectify/ori_resize_data/6/6_2024-10-23-162316-960_1729671796830181_YUYV.png']
-        # pse_rec_right_file = ['/data2/zjq/program/CalibrationNet/Sample_Images/pse_rec/im1.png']
+        # left_train_filelist = ['/data2/zjq/program/imprecise_rectify/resize_data/4/4_2024-10-23-162316-997_1729671796830181_YUYV.png']
+        # right_train_filelist = ['/data2/zjq/program/imprecise_rectify/resize_data/6/6_2024-10-23-162316-960_1729671796830181_YUYV.png']
+        # pse_rec_right_file = ['/data2/zjq/program/imprecise_rectify/ori_resize_data/6/6_2024-10-23-162316-960_1729671796830181_YUYV.png']
+        pse_rec_right_file = ['/data2/zjq/program/CalibrationNet/Sample_Images/pse_rec/im1.png']
     patch_size = 256
     train_db = myImageloader(left_img_files=left_train_filelist, right_img_files=right_train_filelist, supervised=False,
                             train_patch_w=patch_size,
@@ -428,15 +436,21 @@ def main(l_img=None, r_img=None):
     train_loader = torch.utils.data.DataLoader(train_db, batch_size=1, shuffle=True, num_workers=0)
     # model = Net(stereo_model=stereo_model).to(device)
     model = ConfigNet(stereo_model=stereo_model2, stn_mode='projective', ext_disp2depth=False, device=device).to(device)
-    lr = 0.00005
+    lr = 0.001
     # if mono_net == 'midas':
     #     # lr = 0.0001
     #     lr = 0.0001
     # else:
     #     lr = 0.0001
-    num_of_epochs = 50
-    optimizer = optim.SGD(model.parameters(), lr=lr)
-    for param in model.stereo_model.parameters():
+    num_of_epochs = 100
+    iii =0
+    # optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-7)
+    optimizer = optim.SGD(model.parameters(),  lr=lr)
+    # for param in model.stereo_model.parameters():
+    for param in model.parameters():
+    #     iii+=1
+    #     if iii % 3!=0:
+    #         continue
         param.requires_grad = True
     for batch_idx, (left, right, small_left, small_right) in enumerate(train_loader):
         left, right, small_left, small_right = left.to(device), right.to(device), small_left.to(device), small_right.to(device)
@@ -455,59 +469,29 @@ def main(l_img=None, r_img=None):
     should_finish = False
     start_over = False
     loss_array = np.zeros(num_of_epochs, dtype=float)
-    '''
+    # '''
     wandb.init(
         # set the wandb project where this run will be logged
         # project="my-awesome-project",
         project="pse_rec",
         # track hyperparameters and run metadata
         config={
-        "learning_rate": 0.02,
+        "learning_rate": lr,
         "architecture": "CNN",
         "dataset": "CIFAR-100",
-        "epochs": 50,
+        "epochs": num_of_epochs,
         }
     )
     wandb.watch(model, log="all")
-'''
-    import argparse
-    parser = argparse.ArgumentParser(description='HSM')
-    parser.add_argument('--datapath', default='./data-mbtest',
-                        help='test data path')
-    parser.add_argument('--loadmodel', default='final-768px.pth',
-                        help='model path')
-    parser.add_argument('--outdir', default='mboutput/1',
-                        help='output dir')
-    parser.add_argument('--clean', type=float, default=-1,
-                        help='clean up output using entropy estimation')
-    parser.add_argument('--testres', type=float, default=1,
-                        help='test time resolution ratio 0-x')
-    parser.add_argument('--max_disp', type=float, default=400,
-                        help='maximum disparity to search for')
-    parser.add_argument('--level', type=int, default=1,
-                        help='output level of output, default is level 1 (stage 3),\
-                            can also use level 2 (stage 2) or level 3 (stage 1)')
-    args = parser.parse_args()
-    # left_file = '/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im0.png'
-    # right_file = '/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/data-mbtest/mid-pse2/im1.png'
-    left_file = '/data2/zjq/program/imprecise_rectify/resize_data/4/4_2024-10-23-162316-997_1729671796830181_YUYV.png'
-    right_file = '/data2/zjq/program/imprecise_rectify/resize_data/6/6_2024-10-23-162316-960_1729671796830181_YUYV.png'
-    import skimage.io
-    imgL_o = (skimage.io.imread(left_file).astype('float32'))[:,:,:3]
-    imgR_o = (skimage.io.imread(right_file).astype('float32'))[:,:,:3]
-
-    args.datapath = './data-mbtest'
-    args.loadmodel = '/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/final-768px.pth'
-    args.outdir = 'mboutput/1'
-    args.clean = -1
-    args.testres = 1
-    args.max_disp=300
-    args.level=2
-    disp_model = hsm(128,args.clean,level=args.level)
+    # '''
+    level = 1
+    clean = -1
+    loadmodel = '/data2/zjq/program/DepthSensingBeyondLiDARRange-master/DepthSensingBeyondLiDARRange-master/high-res-stereo/final-768px.pth'
+    disp_model = hsm(128,clean,level)
     disp_model = nn.DataParallel(disp_model, device_ids=[0])
     disp_model.cuda()
-    if args.loadmodel is not None:
-        pretrained_dict = torch.load(args.loadmodel)
+    if loadmodel is not None:
+        pretrained_dict = torch.load(loadmodel)
         pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict['state_dict'].items() if 'disp' not in k}
         disp_model.load_state_dict(pretrained_dict['state_dict'],strict=False)
     else:
@@ -515,7 +499,12 @@ def main(l_img=None, r_img=None):
     print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
     from torch.autograd import Variable
     processed = get_transform()
-    # '''
+    for param in disp_model.parameters():
+    #     iii+=1
+    #     if iii % 3!=0:
+    #         continue
+        param.requires_grad = True
+    '''
     wandb.init(
         # set the wandb project where this run will be logged
         # project="my-awesome-project",
@@ -525,15 +514,15 @@ def main(l_img=None, r_img=None):
         "learning_rate": lr,
         "architecture": "CNN",
         "dataset": "CIFAR-100",
-        "epochs": 50,
+        "epochs": num_of_epochs,
         }
     )
     wandb.watch(disp_model, log="all")      
-    # '''
+    '''
   
-    # optimizer1 = optim.SGD(disp_model.parameters(),lr = lr)    
-    optimizer1 = optim.Adam(disp_model.parameters(),lr = lr) 
-    weight = 0.2#右目变换损失的权重
+    optimizer1 = optim.SGD(disp_model.parameters(),lr = lr)    
+    # optimizer1 = optim.Adam(disp_model.parameters(),lr = lr) 
+    weight = 0.1#右目变换损失的权重
     
     #DISP:
     # multip = 48
@@ -548,21 +537,20 @@ def main(l_img=None, r_img=None):
     # imgL = processed(imgL_o).numpy()
     # imgR = processed(imgR_o).numpy()   
     while not should_finish:
-        print(epoch)
-        loss = train(model, stereo_model, disp_model, optimizer, small_left, small_right, left, right)
-        loss_disp = disp_train(disp_model,optimizer1, left, right_transformed_np)
+        loss = train(model, disp_model, optimizer, optimizer1, weight, left, right)
+        # loss_disp = disp_train(disp_model,optimizer1, left, right_transformed_np)
         # disp_train(disp_model, left, right)
-        loss = loss*weight + loss_disp * (1-weight)
-        # disp_train(disp_model, imgL, imgR)
+        # loss = loss*weight + loss_disp * (1-weight)
         if loss < best_test_loss:
             cp_file = os.path.join(dir_checkpoint, 'CP{}.pth'.format(epoch))
             torch.save(model.state_dict(),cp_file)
             print('Checkpoint {} saved !'.format(epoch))
             best_test_loss = loss
-        # wandb.log({"loss": loss})
-        wandb.log({"loss":loss_disp})
+        wandb.log({"loss": loss})
+        # wandb.log({"loss":loss})
+        should_finish = epoch == num_of_epochs        
+        print(epoch, loss)
         epoch += 1
-        should_finish = epoch == num_of_epochs
     # show_best_calibration(cp_file, model, small_left, small_right, mono_net, left, epoch)
     plt.plot(loss_array, marker='o')
     plt.title('Line Plot of Zeros Array')
