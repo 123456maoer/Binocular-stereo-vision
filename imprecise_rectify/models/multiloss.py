@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import models.pytorch_ssim as pytorch_ssim
 from PIL import Image
 import time
+import cv2
 # import IPython, cv2
 
 SSIM_WIN = 5
@@ -19,11 +20,13 @@ class WrappedModel(nn.Module):
 
 
 def gradient_xy(img):
+    gx = img[ :, :-1] - img[ :, 1:]
+    gy = img[ :-1, :] - img[ 1:, :]
+    return gx, gy
+def gradient_xy1(img):
     gx = img[:, :, :, :-1] - img[:, :, :, 1:]
     gy = img[:, :, :-1, :] - img[:, :, 1:, :]
-    
     return gx, gy
-
 
 def warp_disp(x, disp):
     # result + flow(-disp) = x
@@ -154,68 +157,60 @@ def sav_gridsample(matrix):
     # 获取父目录的路径
     parent_dir = os.path.dirname(current_dir)
     # 构造完整的图片保存路径
-    image_path = os.path.join(parent_dir, 'figures/transform_r/image.png')
+    image_path = os.path.join(parent_dir, f'figures/transform_r/image{idx}.png')
     Image.fromarray((output_np * 255).astype(np.uint8)).save(image_path)
 
-def criterion1(L, R):
+def criterion1(L, R): #对左图和视差彩色图进行SSIM或smoothL1
     global idx
     alpha1 = 0
-    alpha2=0.5
+    alpha2=0.85
     tau = 10   
-    R = R.type(torch.float32).to('cuda')
+    # R = R.type(torch.float32).to('cuda')
+    # 假设 R 是一个 NumPy 数组
+    # R = torch.from_numpy(R).type(torch.float32).to('cuda')  # 如果你使用的是 PyTorch 1.x
+    # # 或者如果你使用的是 PyTorch 0.4 或更高版本，可以使用以下方式：
+    # R= torch.tensor(R, dtype=torch.float32, device='cuda')
     ssim_loss = pytorch_ssim.SSIM(window_size = SSIM_WIN)
-    diff_ssim = (1 - ssim_loss(L, R)) 
+    diff_ssim = (1 - ssim_loss(L, R)) /2
     
     L = L.squeeze(0)
     diff_L1 = (F.smooth_l1_loss(L, R, reduction='mean'))
     loss1 = (alpha2 * diff_ssim + (1-alpha2) * diff_L1)
-    # L1loss = F.smooth_l1_loss(L, R, reduction='none').clamp(min=alpha1, max=tau).mean()
-
     return loss1 
-def criterion2(L, R):
+def criterion2(L, R, disp):#对左图进行视差移动，再和右图进行SSIMloss计算
     global idx
     alpha1 = 0
-    alpha2=0.5
+    alpha2=0.85
     tau = 10    # truncation for occluded region
     # L = np.reshape(L, (3, 720, 1280))
     # L = torch.from_numpy(L)
-    L1 = warp_disp(L, R)
+    L1 = warp_disp(L, disp)
     sav_gridsample(L1)
     idx = idx+1
     # R = torch.randn(10, 3)  # 假设这是目标值
     ssim_loss = pytorch_ssim.SSIM(window_size = SSIM_WIN)
-    diff_ssim = (1 - ssim_loss(L, L1)) / 2.0
-    diff_L1 = (F.smooth_l1_loss(L, L1, reduction='mean'))
+    diff_ssim = (1 - ssim_loss(R, L1)) /2
+    diff_L1 = (F.smooth_l1_loss(R, L1, reduction='mean',beta=1.5))
     loss1 = (alpha2 * diff_ssim + (1-alpha2) * diff_L1)
     # L1loss = F.smooth_l1_loss(L, R, reduction='none').clamp(min=alpha1, max=tau).mean()
 
     return loss1
 
-    # R = R.unsqueeze(1)
-    # L = L.unsqueeze(1)
-    # R_gx, R_gy = gradient_xy(R)
-    # L_gx, L_gy = gradient_xy(L)
-    # gxloss = F.smooth_l1_loss(R_gx, L_gx, reduction='none').clamp(min=0, max=tau).mean()
-    # gyloss = F.smooth_l1_loss(R_gy, L_gy, reduction='none').clamp(min=0, max=tau).mean()
-    # g1loss = 0.5 * (gxloss + gyloss)
-    # R_gxx, R_gxy = gradient_xy(R_gx)
-    # R_gyx, R_gyy = gradient_xy(R_gy)
-    # L_gxx, L_gxy = gradient_xy(L_gx)
-    # L_gyx, L_gyy = gradient_xy(L_gy)
-    # gxxloss = F.smooth_l1_loss(R_gxx, L_gxx, reduction='none').clamp(min=0, max=tau).mean()
-    # gyyloss = F.smooth_l1_loss(R_gyy, L_gyy, reduction='none').clamp(min=0, max=tau).mean()
-    # g2loss = 0.5 * (gxxloss + gyyloss)
-
-    # return 0.5 * (L1loss + (g1loss*10 + g2loss*10)/2.0 ) 
-
 
 # loss3
 # smooth loss: force grident of intensity to be small
-def criterion3(disp, img):
-    disp = disp.unsqueeze(1)
+def criterion3(disp, R):
+    img=warp_disp(R.cuda(), -disp)
+    disp = torch.from_numpy(disp).cuda()
+    # disp = disp.unsqueeze(1)
     disp_gx, disp_gy = gradient_xy(disp)
-    intensity_gx, intensity_gy = gradient_xy(img)
-
+    
+    disp_gx = torch.nn.functional.pad(disp_gx.unsqueeze(0), (0, 1), "constant", 0).squeeze(0)
+    disp_gy = torch.nn.functional.pad(disp_gy.unsqueeze(0), (0, 0, 1, 0), "constant", 0).squeeze(0)
+    # disp_gx = F.pad(disp_gx, (0, 1), "constant", 0)
+    intensity_gx, intensity_gy = gradient_xy1(img)
+    intensity_gx = F.pad(intensity_gx, (0, 1), "constant", 0)
+    intensity_gy = F.pad(intensity_gy, (0, 0, 1, 0), "constant", 0)
     weights_x = torch.exp(-10 * torch.abs(intensity_gx).mean(1).unsqueeze(1))
     weights_y = torch.exp(-10 * torch.abs(intensity_gy).mean(1).unsqueeze(1))
 
@@ -241,14 +236,136 @@ def criterion4(disp, maxdisp):
     r = (disp*2/maxdisp - 1).pow(2)
     return r.mean()
 
+def criterion5(disp, imgL, imgR):
+    delta=0.5
+    imgL_np = imgL.squeeze().cpu().permute(1, 2, 0).numpy()  # 转换为 [H, W, C]
+    imgR_np = imgR.squeeze().cpu().permute(1, 2, 0).numpy()  # 转换为 [H, W, C]
 
-def evaluate(model, imgL, imgC, imgR, gt, args, maxd):
+    # 将图像数据类型转换为 uint8
+    imgL_np = (imgL_np * 255).astype(np.uint8)
+    imgR_np = (imgR_np * 255).astype(np.uint8)
+
+    # 转换为灰度图像
+    imgL = cv2.cvtColor(imgL_np, cv2.COLOR_RGB2GRAY)
+    imgR = cv2.cvtColor(imgR_np, cv2.COLOR_RGB2GRAY)
+
+    # 初始化SIFT检测器
+    sift = cv2.SIFT_create()
+
+    # 检测关键点和描述符
+    kp1, des1 = sift.detectAndCompute(imgL, None)
+    kp2, des2 = sift.detectAndCompute(imgR, None)
+
+    # 创建FLANN匹配器
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+
+    # 匹配描述符
+    matches = flann.knnMatch(des1, des2, k=2)
+
+    # 应用比率测试
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.75*n.distance:
+            good_matches.append(m)
+    img_matches = cv2.drawMatches(imgL, kp1, imgR, kp2, good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    save_path = 'figures/seperate'
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    file_name = 'matches.jpg'
+    full_path = os.path.join(save_path, file_name)
+    cv2.imwrite(full_path, img_matches)
+    print(f"图像已保存到 {full_path}")
+    points1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    points2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # 设置纵坐标差异的最大允许值
+    y_diff_threshold = 50
+    x_diff_threshold = 500
+    # 筛选纵坐标差异较小的匹配对
+    filtered_good_matches = []
+    for m, (p1, p2) in zip(good_matches, zip(points1, points2)):
+        y_diff = abs(p1[0][1] - p2[0][1])
+        x_diff = abs(p1[0][0] - p2[0][0])
+        if y_diff <= y_diff_threshold and x_diff <= x_diff_threshold:
+            filtered_good_matches.append(m)
+
+    # 绘制筛选后的匹配结果
+    img_filtered_matches = cv2.drawMatches(imgL, kp1, imgR, kp2, filtered_good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)    
+    save_path = 'figures/seperate'
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    file_name = 'filtered_good_matches.jpg'
+    full_path = os.path.join(save_path, file_name)
+    cv2.imwrite(full_path, img_filtered_matches)
+    print(f"图像已保存到 {full_path}")
+    for i, match in enumerate(good_matches):
+        points1[i, :] = kp1[match.queryIdx].pt
+        points2[i, :] = kp2[match.trainIdx].pt
+    
+    # 将点转换为正确的格式
+    points1 = points1.reshape(-1, 1, 2)
+    points2 = points2.reshape(-1, 1, 2)
+
+    # 计算基础矩阵
+    F, mask = cv2.findFundamentalMat(points1, points2, cv2.FM_LMEDS)
+
+    # 计算极线误差
+    epipolar_errors = []
+    for i in range(len(points1)):
+        # 计算左图像点在右图像中的极线
+        line = cv2.computeCorrespondEpilines(points1[i].reshape(1, 1, 2), 1, F)[0]
+        a, b, c = line.flatten()  # 极线方程的系数
+        x, y = points2[i][0][0], points2[i][0][1] 
+        error = abs(a*x + b*y + c) / np.sqrt(a**2 + b**2) 
+        epipolar_errors.append(error)
+    errors = np.mean(np.abs(epipolar_errors))
+    print("平均极线误差:", errors)
+    is_small_error = np.abs(errors) < delta
+    squared_loss = 0.5 * errors ** 2
+    linear_loss = delta * (np.abs(errors) - 0.5 * delta)
+    errors = errors/40
+    return errors
+def criterion6(left_image, disp):    #disparity epipolar loss@@@@@@wrong
+    height, width = left_image.shape[2],left_image.shape[3]
+    points1 = []
+    points2 = []
+    for v in range(height):
+        for u in range(width):
+            disparity = disp[v, u]
+            if disparity != 0 and disparity != np.inf:
+                x_right = u + disparity
+                if 0 <= x_right < width:
+                    points1.append((u, v))
+                    points2.append((x_right, v))
+    points1 = np.array(points1)
+    points2 = np.array(points2)
+    points1 = points1.reshape(-1, 1, 2)
+    points2 = points2.reshape(-1, 1, 2)
+    F, mask = cv2.findFundamentalMat(points1, points2, cv2.FM_LMEDS)
+    print(F)
+    # epipolar_errors = []
+    epipolar_errors = 0
+    for i in range(len(points1)):
+        # 计算极线
+        line = cv2.computeCorrespondEpilines(points1[i].reshape(1, 1, 2), 1, F)[0]
+        a, b, c = line.flatten()  # 极线方程的系数
+        x, y = points2[i][0][0], points2[i][0][1] 
+        error = abs(a*x + b*y + c) / np.sqrt(a**2 + b**2) 
+        epipolar_errors+=error
+    # mean_error = np.mean(np.abs(epipolar_errors))
+    print("平均极线误差:", epipolar_errors)
+    
+
+
+def evaluate(model, imgL, imgC, imgR, gt, args, maxdisp):
     use_cuda = args.cuda
     # use_cuda = False
     height = imgL.shape[1]
     width = imgL.shape[2]
-    maxdisp = maxd
-
     pad_h = (height // 32 + 1) * 32
     pad_w = (width // 32 + 1) * 32
     imgL = np.reshape(imgL, [1, imgL.shape[0], imgL.shape[1], imgL.shape[2]])
@@ -269,7 +386,7 @@ def evaluate(model, imgL, imgC, imgR, gt, args, maxd):
     if imgC is not None:
         imgC = torch.from_numpy(imgC)
 
-    model.eval()
+    # model.eval()
 
     if imgC is not None:
         # multiscopic mode
@@ -351,7 +468,7 @@ def evaluate_kitti(model, imgL, imgR, gt_occ, gt_noc, args, maxd=160):
     imgL = torch.from_numpy(imgL)
     imgR = torch.from_numpy(imgR)
 
-    model.eval()
+    # model.eval()
     
     if args.cuda:
         imgL, imgR = imgL.cuda(), imgR.cuda()
@@ -403,7 +520,7 @@ def predict(model, imgL, imgR, args, maxd):
     imgL = torch.from_numpy(imgL)
     imgR = torch.from_numpy(imgR)
 
-    model.eval()
+    # model.eval()
 
     if args.cuda:
         imgL, imgR = imgL.cuda(), imgR.cuda()
