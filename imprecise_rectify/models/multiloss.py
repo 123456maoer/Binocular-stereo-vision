@@ -62,6 +62,59 @@ def Loss_prob(y, target, logvar):
     loss = 2**0.5 * F.smooth_l1_loss(y, target, reduction='none').mean(1) * (torch.exp(-logvar) ) + logvar
     loss = loss.clamp(-thresh, thresh).mean()
     return loss
+def compute_epipolar_error(left, right_transformed):
+    delta=0.5
+    imgL_np = left.squeeze().cpu().permute(1, 2, 0).numpy()  # 转换为 [H, W, C]
+    imgR_np = right_transformed.squeeze().cpu().permute(1, 2, 0).numpy()  # 转换为 [H, W, C]
+
+    # 将图像数据类型转换为 uint8
+    imgL_np = (imgL_np * 255).astype(np.uint8)
+    imgR_np = (imgR_np * 255).astype(np.uint8)
+
+    # 转换为灰度图像
+    left_cv = cv2.cvtColor(imgL_np, cv2.COLOR_RGB2GRAY)
+    right_cv = cv2.cvtColor(imgR_np, cv2.COLOR_RGB2GRAY)
+    
+    # # 将图像从Tensor转换为NumPy数组
+    # left_np = left[0].permute(1, 2, 0).cpu().numpy()
+    # right_transformed_np = right_transformed[0].permute(1, 2, 0).cpu().numpy()
+
+    # # 将NumPy数组转换为OpenCV图像
+    # left_cv = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+    # right_transformed_cv = cv2.cvtColor(right_transformed_np, cv2.COLOR_RGB2BGR)
+    # 检测关键点和描述符
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(left_cv, None)
+    kp2, des2 = orb.detectAndCompute(right_cv, None)
+
+    # 匹配描述符
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    
+    # 提取匹配点
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+    # 计算基础矩阵
+    F, mask = cv2.findFundamentalMat(pts1.reshape(-1, 2), pts2.reshape(-1, 2), cv2.FM_RANSAC)
+    if mask is None:
+        raise ValueError("Fundamental matrix could not be computed. Check the input points.")
+    # 计算极线误差
+    pts1 = pts1[mask.ravel() == 1]
+    pts2 = pts2[mask.ravel() == 1]
+
+    lines1 = cv2.computeCorrespondEpilines(pts2.reshape(-1, 1, 2), 2, F)
+    lines1 = lines1.reshape(-1, 3)
+    lines2 = cv2.computeCorrespondEpilines(pts1.reshape(-1, 1, 2), 1, F)
+    lines2 = lines2.reshape(-1, 3)
+
+    error = 0
+    for pt1, pt2, line1, line2 in zip(pts1, pts2, lines1, lines2):
+        error += abs(line1[0] * pt1[0] + line1[1] * pt1[1] + line1[2])
+        error += abs(line2[0] * pt2[0] + line2[1] * pt2[1] + line2[2])
+    A = error/(len(pt1)+len(pt2))
+    return A/(A+1)
 # loss1
 # appearance loss: the difference between reconstructed image and original image
 def criterion1_normal(imgC, imgR, imgL, outputR, outputL, maxdisp, args, down_factor=1):
@@ -196,7 +249,6 @@ def criterion2(L, R, disp):#对左图进行视差移动，再和右图进行SSIM
 
     return loss1
 
-
 # loss3
 # smooth loss: force grident of intensity to be small
 def criterion3(disp, R):
@@ -272,13 +324,13 @@ def criterion5(disp, imgL, imgR):
         if m.distance < 0.75*n.distance:
             good_matches.append(m)
     img_matches = cv2.drawMatches(imgL, kp1, imgR, kp2, good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    save_path = 'figures/seperate'
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    file_name = 'matches.jpg'
-    full_path = os.path.join(save_path, file_name)
-    cv2.imwrite(full_path, img_matches)
-    print(f"图像已保存到 {full_path}")
+    # save_path = 'figures/seperate'
+    # if not os.path.exists(save_path):
+    #     os.makedirs(save_path)
+    # file_name = 'matches.jpg'
+    # full_path = os.path.join(save_path, file_name)
+    # cv2.imwrite(full_path, img_matches)
+    # print(f"图像已保存到 {full_path}")
     points1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     points2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
@@ -301,7 +353,6 @@ def criterion5(disp, imgL, imgR):
     file_name = 'filtered_good_matches.jpg'
     full_path = os.path.join(save_path, file_name)
     cv2.imwrite(full_path, img_filtered_matches)
-    print(f"图像已保存到 {full_path}")
     for i, match in enumerate(good_matches):
         points1[i, :] = kp1[match.queryIdx].pt
         points2[i, :] = kp2[match.trainIdx].pt
@@ -327,7 +378,7 @@ def criterion5(disp, imgL, imgR):
     is_small_error = np.abs(errors) < delta
     squared_loss = 0.5 * errors ** 2
     linear_loss = delta * (np.abs(errors) - 0.5 * delta)
-    errors = errors/40
+    errors = errors/(errors+1)
     return errors
 def criterion6(left_image, disp):    #disparity epipolar loss@@@@@@wrong
     height, width = left_image.shape[2],left_image.shape[3]
